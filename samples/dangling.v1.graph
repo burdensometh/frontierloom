@@ -1,0 +1,15 @@
+FRONTIERLOOM_GRAPH 1
+revision 8
+vertices 5
+1
+2
+3
+4
+5
+edges 5
+1 2
+1 3
+2 3
+3 1
+4 3
+end

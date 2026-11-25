@@ -1,0 +1,31 @@
+FRONTIERLOOM_CHECKPOINT 1
+graph 7 17533187202138994177
+program bfs 10 0.84999999999999998 1e-10 1000001
+cursor 1 1
+placement 1 2 8
+owners 0 1 0 1 0 1 0 1
+totals 1 1 2 2 0 0 0 0
+last 1
+step 0 1 8 1 1 2 0 0 0 2 11324005020580347697 running
+mailbox 1 2
+shard 0 0 0
+shard 1 0 0
+shard 2 1 0
+vertex 0 0
+shard 3 3 1
+vertex inf 0
+vertex inf 0
+vertex inf 0
+message 2 1
+shard 4 3 1
+vertex inf 0
+vertex inf 0
+vertex inf 0
+message 1 1
+shard 5 1 0
+vertex inf 0
+shard 6 0 0
+shard 7 1 0
+vertex inf 0
+end
+checksum 17161323832133195709
