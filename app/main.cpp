@@ -16,8 +16,21 @@ public:
     Arguments(int argc, char** argv) {
         for (int index = 2; index < argc; ++index) {
             std::string key(argv[index]);
-            if (key == "--verify" || key == "--quiet" || key == "--details" || key == "--audit") {
+            if (key == "--verify" || key == "--quiet" || key == "--details" || key == "--audit" ||
+                key == "--compact" || key == "--v2" || key == "--with-dictionary" ||
+                key == "--declare-dictionary" || key == "--dictionary-declaration") {
                 if (!flags_.insert(key).second) {
+                    throw std::invalid_argument("duplicate flag " + key);
+                }
+                continue;
+            }
+            // "--dictionary" may be a value option (external label map) or a
+            // valueless output-format flag for canonicalize/compact.
+            if (key == "--dictionary") {
+                if (index + 1 < argc &&
+                    !std::string_view(argv[index + 1]).starts_with("--")) {
+                    options_[key].emplace_back(argv[++index]);
+                } else if (!flags_.insert(key).second) {
                     throw std::invalid_argument("duplicate flag " + key);
                 }
                 continue;
@@ -92,7 +105,13 @@ void usage(std::ostream& out) {
   inspect --graph FILE --checkpoint FILE [--vector FILE|-] [--verify] [--details] [--audit]
   plan --graph FILE --checkpoint FILE --workers N
   reference --graph FILE --algorithm bfs|pagerank [program options] [--vector FILE|-]
-  canonicalize --graph FILE --out FILE
+  canonicalize --graph FILE --out FILE [--compact|--v2|--format v2]
+  compact --graph FILE --out FILE
+
+Graph manifests accept v1 (external IDs on edges) and v2 declarable external
+vertex dictionaries with compact labels.  --dictionary FILE supplies an
+external label map used to resolve a compact graph.  An incomplete dictionary
+reference fails before any checkpoint is published.
 
 BFS requires --source ID. PageRank supports --damping D and --tolerance E.
 Both support --limit N and --config FILE.
@@ -210,10 +229,21 @@ int mutable_command(std::string_view command, Arguments& args, const Graph& grap
 
 int run(std::string_view command, Arguments& args) {
     if (command != "compute" && command != "resume" && command != "scale" &&
-        command != "inspect" && command != "plan" && command != "reference" && command != "canonicalize") {
+        command != "inspect" && command != "plan" && command != "reference" &&
+        command != "canonicalize" && command != "compact" && command != "dictionary") {
         throw std::invalid_argument("unknown command " + std::string(command));
     }
-    const auto graph = load_graph(args.need("--graph"));
+    const auto graph_file = args.need("--graph");
+    auto external_dictionary = args.single("--dictionary");
+    for (const char* alias :
+         {"--dictionary-file", "--external-dictionary", "--label-map", "--labels"}) {
+        if (const auto path = args.single(alias); path && !external_dictionary) {
+            external_dictionary = path;
+        }
+    }
+    const Graph graph = external_dictionary
+                            ? load_graph(graph_file, *external_dictionary)
+                            : load_graph(graph_file);
     if (command == "compute" || command == "resume" || command == "scale") {
         return mutable_command(command, args, graph);
     }
@@ -254,10 +284,26 @@ int run(std::string_view command, Arguments& args) {
     }
 
     const auto path = args.need("--out");
+    const auto format = args.single("--format");
+    const auto graph_format = args.single("--graph-format");
+    const auto graph_version = args.single("--graph-version");
+    const bool dictionary_output =
+        command == "compact" || command == "dictionary" || args.flag("--compact") ||
+        args.flag("--v2") || args.flag("--with-dictionary") ||
+        args.flag("--declare-dictionary") || args.flag("--dictionary-declaration") ||
+        args.flag("--dictionary") ||
+        (format && (*format == "v2" || *format == "2")) ||
+        (graph_format && (*graph_format == "v2" || *graph_format == "2")) ||
+        (graph_version && *graph_version == "2");
     args.finish();
-    save_graph(path, graph);
+    if (dictionary_output) {
+        save_graph_v2(path, graph);
+    } else {
+        save_graph(path, graph);
+    }
     std::cerr << "graph revision=" << graph.revision() << " identity=" << graph.identity()
-              << " vertices=" << graph.size() << " edges=" << graph.edge_count() << '\n';
+              << " vertices=" << graph.size() << " edges=" << graph.edge_count()
+              << " format=" << (dictionary_output ? 2 : 1) << '\n';
     return 0;
 }
 
