@@ -52,7 +52,11 @@ void print_timing(std::ostream& output, const StepTiming& timing) {
            << " merge_us=" << timing.merge_us
            << " publish_us=" << timing.publish_us
            << " wire_sent=" << timing.wire_sent
-           << " wire_received=" << timing.wire_received;
+           << " wire_received=" << timing.wire_received
+           << " dispatched_shards=" << timing.dispatched_shards
+           << " idle_shards=" << timing.idle_shards
+           << " dispatched_workers=" << timing.dispatched_workers
+           << " idle_workers=" << timing.idle_workers;
 }
 
 }  // namespace

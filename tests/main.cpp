@@ -12,6 +12,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -307,6 +308,50 @@ void engine_suite(const std::filesystem::path& samples) {
         check(pids.size() == 2 && !pids.contains(::getpid()), "engine launched distinct child processes");
         check(retired == 2, "healthy workers acknowledge close and are reaped");
         check(verify_result(graph, uninterrupted).ok, "clean distributed BFS verifies");
+    }
+    {
+        // Sparse-frontier adaptive dispatch: the campus source reaches only one
+        // shard at epoch zero, so a single dispatch covers it while every shard
+        // still settles the same round through an idle receipt.
+        Store store(scratch.file("adaptive.flc"));
+        std::uint32_t least_dispatched = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t partial_rounds{};
+        const Observer observe = [&](const Event& event) {
+            if (!event.timing) {
+                return;
+            }
+            const auto& timing = *event.timing;
+            check(timing.dispatched_shards + timing.idle_shards == 8,
+                  "adaptive dispatch still accounts for every shard");
+            check(timing.dispatched_workers + timing.idle_workers == 2,
+                  "adaptive dispatch still accounts for every worker");
+            check(timing.dispatched_shards > 0, "every round dispatches at least one shard");
+            least_dispatched = std::min(least_dispatched, timing.dispatched_shards);
+            if (timing.idle_shards > 0) {
+                ++partial_rounds;
+            }
+        };
+        const auto adaptive = compute(graph, store, start, Runtime{}, observe);
+        check(least_dispatched == 1, "a sparse BFS frontier dispatches only its active shard");
+        check(partial_rounds > 0, "idle shards are reported on sparse rounds");
+        check(adaptive.totals.emitted == uninterrupted.totals.emitted &&
+              adaptive.totals.consumed == uninterrupted.totals.consumed &&
+              result_vector(graph, adaptive) == result_vector(graph, uninterrupted),
+              "adaptive dispatch preserves BFS distances, rounds and message counts");
+    }
+    {
+        // PageRank recomputes every vertex each epoch: adaptive skipping must
+        // never idle a PageRank shard, even at the empty-inbox epoch zero.
+        const auto rank_graph = load_graph(samples / "dangling.v1.graph");
+        Store store(scratch.file("adaptive-rank.flc"));
+        const Observer observe = [&](const Event& event) {
+            if (event.timing) {
+                check(event.timing->idle_shards == 0 && event.timing->idle_workers == 0,
+                      "PageRank always dispatches every shard");
+            }
+        };
+        const auto ranked = compute(rank_graph, store, {pagerank(), 7, 3}, Runtime{}, observe);
+        check(verify_result(rank_graph, ranked).ok, "full-coverage PageRank still verifies");
     }
     {
         Runtime controls;

@@ -27,11 +27,19 @@ public:
     [[nodiscard]] std::span<const Partition> assigned() const { return assigned_; }
     [[nodiscard]] wire::TrafficCount traffic() const { return channel_.traffic(); }
 
-    void submit(const Checkpoint& image, double original_dangling) const;
+    // Dispatches only the shards that hold pending frontier work; active must
+    // be non-empty. Shards without work are settled separately through idle().
+    void submit(const Checkpoint& image, double original_dangling,
+                std::span<const Partition> active) const;
     [[nodiscard]] std::vector<PartitionResult> receive(const Graph& graph, const Shards& shards,
                                                        Epoch epoch) const;
     void confirm(Epoch epoch, std::span<const StagedBatch> batches) const;
     [[nodiscard]] std::vector<BarrierReceipt> receipts(Epoch epoch) const;
+    // Sends the same-round idle settlement command and reads back receipts for
+    // every partition named in idle_parts, each covering an empty batch.
+    void idle(Epoch epoch, std::span<const Partition> idle_parts) const;
+    [[nodiscard]] std::vector<BarrierReceipt>
+    idle_receipts(Epoch epoch, std::span<const Partition> idle_parts) const;
     [[nodiscard]] StepInput export_shard(const StepInput& work, const Graph& graph,
                                          const Shards& shards) const;
     void import_shard(const StepInput& work) const;

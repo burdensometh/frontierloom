@@ -26,6 +26,13 @@ struct StepTiming {
     std::uint64_t publish_us{};
     std::uint64_t wire_sent{};
     std::uint64_t wire_received{};
+    // Adaptive BFS dispatch coverage for this round. Every shard and worker
+    // still settles the same epoch; the idle counts prove idle participation
+    // rather than a missing task.
+    std::uint32_t dispatched_shards{};
+    std::uint32_t idle_shards{};
+    std::uint32_t dispatched_workers{};
+    std::uint32_t idle_workers{};
 };
 
 struct Event {

@@ -2,6 +2,8 @@
 #include "kernel/contract.hpp"
 #include "mailbox/exchange.hpp"
 
+#include <numeric>
+
 namespace frontier {
 namespace {
 
@@ -46,37 +48,99 @@ PreparedStep WorkerPool::step(const Checkpoint& image, double original_dangling,
     Exchange exchange(graph_, shards_, image.program.algorithm, image.next_epoch, placement_, attempts_);
     Barrier barrier(graph_, shards_, image.program, placement_, attempts_, image.mailbox);
 
+    // Adaptive dispatch: only BFS shards whose inbox holds the pending frontier
+    // skip the kernel. PageRank recomputes every vertex each epoch (its barrier
+    // requires full vertex coverage), so every PageRank shard stays active even
+    // when an epoch starts with an empty inbox (e.g. the epoch-zero scatter).
+    const bool sparse_dispatch = image.program.algorithm == Algorithm::bfs;
+    std::vector<std::vector<Partition>> active(placement_.workers);
+    std::vector<std::vector<Partition>> idle(placement_.workers);
+    for (Partition part = 0; part < shards_.count(); ++part) {
+        const auto owner = placement_.owner(part);
+        if (sparse_dispatch && image.mailbox.inboxes.at(part).empty()) {
+            idle[owner].push_back(part);
+        } else {
+            active[owner].push_back(part);
+        }
+    }
+
     StepTiming timing;
+    timing.dispatched_shards = shards_.count() - static_cast<std::uint32_t>(
+        std::accumulate(idle.begin(), idle.end(), std::size_t{},
+                        [](std::size_t total, const auto& parts) { return total + parts.size(); }));
+    timing.idle_shards = shards_.count() - timing.dispatched_shards;
+    for (Worker worker = 0; worker < placement_.workers; ++worker) {
+        if (active[worker].empty()) {
+            ++timing.idle_workers;
+        } else {
+            ++timing.dispatched_workers;
+        }
+    }
+
     const auto previous_traffic = traffic();
     auto phase = Clock::now();
+    // Dispatch phase: commands only. Every worker receives the shards holding
+    // pending frontier work as compute, and its remaining leased shards as an
+    // idle settlement. Both belong to the same epoch; replies are read later in
+    // command order so socket frames never cross.
     for (const auto& process : processes_) {
-        contact(*process, "dispatch", [&] { process->submit(image, original_dangling); });
+        const auto worker = process->attempt().worker;
+        contact(*process, "dispatch", [&] {
+            if (!active[worker].empty()) {
+                process->submit(image, original_dangling, active[worker]);
+            }
+            if (!idle[worker].empty()) {
+                process->idle(image.next_epoch, idle[worker]);
+            }
+        });
     }
     timing.dispatch_us = elapsed(phase);
 
     phase = Clock::now();
-    std::vector<std::vector<VertexState>> next_states(shards_.count());
+    // Idle shards keep their committed vertex image; active shards are replaced
+    // by the kernel results below, so every partition still yields a full state.
+    std::vector<std::vector<VertexState>> next_states = image.states;
     std::vector<std::vector<StagedBatch>> staged(placement_.workers);
+    std::vector<std::vector<BarrierReceipt>> idle_receipts(placement_.workers);
     for (const auto& process : processes_) {
         const auto worker = process->attempt().worker;
-        auto outputs = contact(*process, "stage", [&] {
-            return process->receive(graph_, shards_, image.next_epoch);
-        });
-        auto& collected = staged[worker];
-        collected.reserve(outputs.size());
-        for (auto& output : outputs) {
-            const auto part = output.batch.source_partition;
-            try {
-                validate_partition_output(graph_, shards_, image.program,
-                                          image.work(part, original_dangling), output);
-            } catch (const std::invalid_argument& error) {
-                throw wire::Failure("invalid output from worker " + std::to_string(worker) +
-                                    " for partition " + std::to_string(part) + ": " + error.what());
+        if (!active[worker].empty()) {
+            auto outputs = contact(*process, "stage", [&] {
+                return process->receive(graph_, shards_, image.next_epoch);
+            });
+            auto& collected = staged[worker];
+            collected.reserve(outputs.size() + idle[worker].size());
+            for (auto& output : outputs) {
+                const auto part = output.batch.source_partition;
+                try {
+                    validate_partition_output(graph_, shards_, image.program,
+                                              image.work(part, original_dangling), output);
+                } catch (const std::invalid_argument& error) {
+                    throw wire::Failure("invalid output from worker " + std::to_string(worker) +
+                                        " for partition " + std::to_string(part) + ": " + error.what());
+                }
+                const auto digest = exchange.stage(std::move(output.batch));
+                collected.push_back({part, digest, output.stats});
+                next_states[part] = std::move(output.states);
             }
-            const auto digest = exchange.stage(std::move(output.batch));
-            collected.push_back({part, digest, output.stats});
-            next_states[part] = std::move(output.states);
         }
+        if (!idle[worker].empty()) {
+            idle_receipts[worker] = contact(*process, "idle receipt", [&] {
+                return process->idle_receipts(image.next_epoch, idle[worker]);
+            });
+            // Idle shards use empty batches but take the identical stage path,
+            // so every partition occupies an exchange slot before confirmation.
+            for (const auto& receipt : idle_receipts[worker]) {
+                const auto digest = exchange.stage(
+                    MessageBatch{image.next_epoch, attempts_[worker], receipt.partition, {}});
+                if (digest != receipt.batch || receipt.stats != StepStats{}) {
+                    throw wire::Failure("idle worker receipt does not bind an empty batch");
+                }
+                staged[worker].push_back({receipt.partition, digest, StepStats{}});
+            }
+        }
+        // Fault boundaries cover idle settlements too: zero staged messages are
+        // reported as an acknowledged round, never as a missing worker task.
         if (on_staged) {
             on_staged(worker, exchange.staged_messages());
         }
@@ -86,11 +150,24 @@ PreparedStep WorkerPool::step(const Checkpoint& image, double original_dangling,
     phase = Clock::now();
     for (const auto& process : processes_) {
         const auto worker = process->attempt().worker;
-        contact(*process, "confirm", [&] { process->confirm(image.next_epoch, staged[worker]); });
+        // Kernel results and idle receipts were appended separately; reorder so
+        // the acknowledgement matches the worker's partition-sorted pending set.
+        std::sort(staged[worker].begin(), staged[worker].end(),
+                  [](const StagedBatch& left, const StagedBatch& right) {
+                      return left.partition < right.partition;
+                  });
+        contact(*process, "confirm", [&] {
+            process->confirm(image.next_epoch, staged[worker]);
+        });
     }
     for (const auto& process : processes_) {
         const auto worker = process->attempt().worker;
-        const auto receipts = contact(*process, "receipt", [&] { return process->receipts(image.next_epoch); });
+        const auto receipts = contact(*process, "receipt", [&] {
+            return process->receipts(image.next_epoch);
+        });
+        if (receipts.size() != staged[worker].size()) {
+            throw wire::Failure("worker receipt count disagrees with its settled shards");
+        }
         for (std::size_t index = 0; index < receipts.size(); ++index) {
             const auto& receipt = receipts[index];
             const auto& expected = staged[worker][index];

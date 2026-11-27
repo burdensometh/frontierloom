@@ -35,6 +35,31 @@ void verify_header(Decoder& in, WorkerAttempt attempt, Epoch epoch) {
     }
 }
 
+// Shared decoder for both kernel confirmations and same-round idle receipts:
+// every receipt must stay inside the worker's lease, arrive in partition
+// order and carry the open epoch and the worker's current attempt.
+std::vector<BarrierReceipt> decode_receipt_set(Decoder& in, Epoch epoch,
+                                               std::span<const Partition> assigned,
+                                               const WorkerAttempt& attempt) {
+    const auto count = in.u32();
+    if (count == 0 || count > assigned.size()) {
+        throw Failure("worker returned an empty or oversized receipt set");
+    }
+    std::vector<BarrierReceipt> result;
+    result.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        auto receipt = wire::decode_receipt(in);
+        if (!std::binary_search(assigned.begin(), assigned.end(), receipt.partition) ||
+            (index > 0 && result.back().partition >= receipt.partition) ||
+            receipt.epoch != epoch || receipt.attempt != attempt) {
+            throw Failure("worker receipt carries the wrong partition, epoch or attempt");
+        }
+        result.push_back(receipt);
+    }
+    in.finish();
+    return result;
+}
+
 void close_inherited(int keep) {
     // Closing every other endpoint and the parent's checkpoint lock ensures
     // child EOF and lock lifetime remain tied to their actual owners.
@@ -90,6 +115,9 @@ public:
             case Kind::compute:
                 compute(channel, input);
                 break;
+            case Kind::idle:
+                settle_idle(channel, input);
+                break;
             case Kind::confirm:
                 confirm(channel, input);
                 break;
@@ -136,16 +164,29 @@ private:
         }
     }
 
+    // Returns whether an earlier dispatch in this still-open epoch already
+    // registered a receipt (kernel result or idle settlement) for part.
+    bool already_settled(Partition part) const {
+        return std::any_of(pending_.begin(), pending_.end(),
+                           [part](const BarrierReceipt& receipt) {
+                               return receipt.partition == part;
+                           });
+    }
+
     void compute(const wire::Channel& channel, Decoder& input) {
-        if (!pending_.empty() || input.u32() != assigned_.size()) {
-            throw Failure("worker has pending acknowledgements or incomplete work");
+        const auto count = input.u32();
+        if (count == 0 || pending_.size() + count > assigned_.size()) {
+            throw Failure("worker received an empty or oversized compute dispatch");
         }
         std::vector<PartitionResult> results;
-        results.reserve(assigned_.size());
-        for (const auto part : assigned_) {
+        results.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
             auto work = wire::decode_work(input, graph_, shards_);
-            if (work.partition != part) {
-                throw Failure("worker received out-of-order partition work");
+            const auto part = work.partition;
+            if (!std::binary_search(assigned_.begin(), assigned_.end(), part) ||
+                already_settled(part) ||
+                (index > 0 && results.back().batch.source_partition >= part)) {
+                throw Failure("worker received duplicate, unordered or foreign partition work");
             }
             require_resident(work);
             results.push_back(run_partition(graph_, shards_, program_, attempt_, work));
@@ -162,7 +203,56 @@ private:
             resident_[part] = std::move(result.states);
             imported_[part].reset();
         }
+        std::sort(pending_.begin(), pending_.end(),
+                  [](const BarrierReceipt& left, const BarrierReceipt& right) {
+                      return left.partition < right.partition;
+                  });
         send(channel, Kind::batches, std::move(reply), idle_deadline());
+    }
+
+    // An idle settlement still belongs to the open epoch. The worker skips the
+    // kernel for its empty-frontier shards and registers zero-stat receipts for
+    // their empty batches. The receipts join pending_ like kernel output, so a
+    // mixed worker settles active and idle shards under one confirm; the epoch
+    // advances only once every leased shard is accounted for.
+    void settle_idle(const wire::Channel& channel, Decoder& input) {
+        const auto count = input.u32();
+        if (count == 0 || pending_.size() + count > assigned_.size()) {
+            throw Failure("worker received an empty or oversized idle settlement");
+        }
+        std::vector<Partition> idle;
+        idle.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto part = input.u32();
+            if (!std::binary_search(assigned_.begin(), assigned_.end(), part) ||
+                already_settled(part) || (!idle.empty() && idle.back() >= part)) {
+                throw Failure("idle settlement names a duplicate or foreign partition");
+            }
+            if (awaiting_[part]) {
+                throw Failure("cannot idle a partition awaiting a handoff");
+            }
+            // An idle settlement is still a committed round for this shard, so
+            // the one-shot migration digest guard expires exactly as it would
+            // after a kernel step; otherwise a later export sees a stale guard.
+            imported_[part].reset();
+            idle.push_back(part);
+        }
+        input.finish();
+
+        Encoder reply;
+        encode_header(reply, attempt_, epoch_);
+        reply.u32(static_cast<std::uint32_t>(idle.size()));
+        for (const auto part : idle) {
+            const MessageBatch empty{epoch_, attempt_, part, {}};
+            const auto digest = batch_digest(empty);
+            pending_.push_back({epoch_, attempt_, part, digest, {}});
+            wire::encode(reply, pending_.back());
+        }
+        std::sort(pending_.begin(), pending_.end(),
+                  [](const BarrierReceipt& left, const BarrierReceipt& right) {
+                      return left.partition < right.partition;
+                  });
+        send(channel, Kind::idle_receipts, std::move(reply), idle_deadline());
     }
 
     void confirm(const wire::Channel& channel, Decoder& input) {
@@ -185,8 +275,11 @@ private:
             wire::encode(reply, receipt);
         }
         send(channel, Kind::receipts, std::move(reply), idle_deadline());
+        const auto settled_all = pending_.size() == assigned_.size();
         pending_.clear();
-        ++epoch_;
+        if (settled_all) {
+            ++epoch_;
+        }
     }
 
     void export_shard(const wire::Channel& channel, Decoder& input) const {
@@ -331,11 +424,15 @@ Decoder WorkerProcess::reply_header(const wire::Frame& frame, Epoch epoch) const
     return input;
 }
 
-void WorkerProcess::submit(const Checkpoint& image, double original_dangling) const {
+void WorkerProcess::submit(const Checkpoint& image, double original_dangling,
+                           std::span<const Partition> active) const {
+    if (active.empty()) {
+        throw Failure("controller dispatched compute without active partitions");
+    }
     Encoder request;
     encode_header(request, attempt_, image.next_epoch);
-    request.u32(static_cast<std::uint32_t>(assigned_.size()));
-    for (const auto part : assigned_) {
+    request.u32(static_cast<std::uint32_t>(active.size()));
+    for (const auto part : active) {
         wire::encode(request, image.work(part, original_dangling));
     }
     send(channel_, Kind::compute, std::move(request), deadline());
@@ -345,15 +442,19 @@ std::vector<PartitionResult> WorkerProcess::receive(const Graph& graph, const Sh
                                                     Epoch epoch) const {
     const auto frame = channel_.expect(Kind::batches, deadline());
     auto input = reply_header(frame, epoch);
-    if (input.u32() != assigned_.size()) {
-        throw Failure("worker omitted partition results");
+    const auto count = input.u32();
+    if (count == 0 || count > assigned_.size()) {
+        throw Failure("worker returned an empty or oversized partition result set");
     }
     std::vector<PartitionResult> results;
-    results.reserve(assigned_.size());
-    for (const auto part : assigned_) {
+    results.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
         auto result = wire::decode_result(input, graph, shards);
-        if (result.batch.source_partition != part || result.batch.attempt != attempt_ ||
-            result.batch.epoch != epoch || result.stats.emitted != result.batch.messages.size()) {
+        const auto part = result.batch.source_partition;
+        if (!std::binary_search(assigned_.begin(), assigned_.end(), part) ||
+            (index > 0 && results.back().batch.source_partition >= part) ||
+            result.batch.attempt != attempt_ || result.batch.epoch != epoch ||
+            result.stats.emitted != result.batch.messages.size()) {
             throw Failure("worker result has an incorrect partition, lease, epoch, or emission count");
         }
         results.push_back(std::move(result));
@@ -376,19 +477,35 @@ void WorkerProcess::confirm(Epoch epoch, std::span<const StagedBatch> batches) c
 std::vector<BarrierReceipt> WorkerProcess::receipts(Epoch epoch) const {
     const auto frame = channel_.expect(Kind::receipts, deadline());
     auto input = reply_header(frame, epoch);
-    if (input.u32() != assigned_.size()) {
-        throw Failure("worker omitted partition receipts");
+    return decode_receipt_set(input, epoch, assigned_, attempt_);
+}
+
+void WorkerProcess::idle(Epoch epoch, std::span<const Partition> idle_parts) const {
+    if (idle_parts.empty()) {
+        throw Failure("controller sent an idle settlement without partitions");
     }
-    std::vector<BarrierReceipt> result;
-    result.reserve(assigned_.size());
-    for (const auto part : assigned_) {
-        auto receipt = wire::decode_receipt(input);
-        if (receipt.partition != part || receipt.epoch != epoch || receipt.attempt != attempt_) {
-            throw Failure("worker receipt carries the wrong partition, epoch or attempt");
+    Encoder request;
+    encode_header(request, attempt_, epoch);
+    request.u32(static_cast<std::uint32_t>(idle_parts.size()));
+    for (const auto part : idle_parts) {
+        request.u32(part);
+    }
+    send(channel_, Kind::idle, std::move(request), deadline());
+}
+
+std::vector<BarrierReceipt> WorkerProcess::idle_receipts(
+    Epoch epoch, std::span<const Partition> idle_parts) const {
+    const auto frame = channel_.expect(Kind::idle_receipts, deadline());
+    auto input = reply_header(frame, epoch);
+    auto result = decode_receipt_set(input, epoch, assigned_, attempt_);
+    if (result.size() != idle_parts.size()) {
+        throw Failure("worker idle settlement returned the wrong receipt count");
+    }
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        if (result[index].partition != idle_parts[index]) {
+            throw Failure("worker idle receipt names an unexpected partition");
         }
-        result.push_back(receipt);
     }
-    input.finish();
     return result;
 }
 

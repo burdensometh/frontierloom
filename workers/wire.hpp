@@ -24,6 +24,12 @@ enum class Kind : std::uint32_t {
     imported,
     close,
     closed,
+    // Adaptive BFS dispatch: a worker whose assigned shards all have empty
+    // inboxes settles the epoch without running a kernel, so idle participation
+    // is acknowledged in the same round instead of looking like a lost task.
+    // These stay below error so the frame header range check stays valid.
+    idle,
+    idle_receipts,
     error
 };
 
