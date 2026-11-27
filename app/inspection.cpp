@@ -2,6 +2,7 @@
 #include "checkpoint/audit.hpp"
 #include "graph/distribution.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <ostream>
 
@@ -114,6 +115,44 @@ void print_scale_plan(std::ostream& out, const Graph& graph, const Checkpoint& c
         print_worker(out, worker, plan.target, checkpoint, next);
     }
     print_traffic(out, next, plan.target.generation);
+}
+
+void print_scale_plan(std::ostream& out, const Graph& graph, const Checkpoint& checkpoint,
+                      Worker target_id, std::uint64_t edge_budget) {
+    const auto& current = checkpoint.placement;
+    const Shards shards(graph, static_cast<Partition>(current.owners.size()));
+    const auto previous = measure_distribution(graph, shards, current);
+    const auto loads_before = worker_edge_loads(shards, graph, current);
+    const auto plan = plan_scale_budgeted(shards, graph, current, target_id, edge_budget);
+    if (!plan) {
+        out << "plan epoch=" << checkpoint.next_epoch
+            << " from_topology=" << current.generation << " from_workers=" << current.workers
+            << " to_workers=" << target_id << " edge_budget=" << edge_budget
+            << " peak_from=" << *std::max_element(loads_before.begin(), loads_before.end())
+            << " status=infeasible reason=edge-budget" << '\n';
+        return;
+    }
+    const auto next = measure_distribution(graph, shards, plan->target);
+    const auto dangling = initial_dangling(graph, checkpoint.program);
+    const auto loads_after = worker_edge_loads(shards, graph, plan->target);
+    out << "plan epoch=" << checkpoint.next_epoch
+        << " from_topology=" << current.generation << " to_topology=" << plan->target.generation
+        << " from_workers=" << current.workers << " to_workers=" << plan->target.workers
+        << " edge_budget=" << edge_budget
+        << " peak_from=" << *std::max_element(loads_before.begin(), loads_before.end())
+        << " peak_to=" << *std::max_element(loads_after.begin(), loads_after.end())
+        << " moved=" << plan->moves.size() << " edges_from_cross_worker=" << previous.cross_worker
+        << " edges_to_cross_worker=" << next.cross_worker << " status=feasible" << '\n';
+    for (const auto& move : plan->moves) {
+        const auto image = checkpoint.work(move.partition, dangling);
+        out << "move partition=" << move.partition << " from=" << move.previous << " to=" << move.next
+            << " states=" << image.states.size() << " pending=" << image.inbox.size()
+            << " image=" << work_digest(image) << '\n';
+    }
+    for (Worker worker = 0; worker < plan->target.workers; ++worker) {
+        print_worker(out, worker, plan->target, checkpoint, next);
+    }
+    print_traffic(out, next, plan->target.generation);
 }
 
 void print_audit(std::ostream& out, const Graph& graph, const Checkpoint& checkpoint) {

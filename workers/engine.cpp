@@ -229,7 +229,7 @@ private:
     }
 
     void apply_scale(Worker workers) {
-        const auto plan = plan_scale(image_.placement, workers);
+        const auto plan = budgeted_plan(workers);
         if (plan.target == image_.placement) {
             return;
         }
@@ -252,9 +252,30 @@ private:
         pool_.swap(next);
         auto observation = event(Event::Kind::scaled);
         observation.moved = plan.moves.size();
+        const auto loads = worker_edge_loads(shards_, graph_, image_.placement);
+        observation.peak_edges = *std::max_element(loads.begin(), loads.end());
         observation.pids = pool_->pids();
         emit(std::move(observation));
         retire(*next, std::move(retired));
+    }
+
+    // Produces the exact placement that the `plan` command would display for the
+    // same checkpoint, target and budget. A configured edge budget is mandatory:
+    // if no target placement keeps every worker within the budget the transition
+    // is refused, never downgraded to an over-budget layout.
+    [[nodiscard]] ScalePlan budgeted_plan(Worker workers) const {
+        if (!runtime_.edge_budget) {
+            return plan_scale(image_.placement, workers);
+        }
+        auto plan = plan_scale_budgeted(shards_, graph_, image_.placement, workers,
+                                        *runtime_.edge_budget);
+        if (!plan) {
+            throw std::runtime_error(
+                "edge budget " + std::to_string(*runtime_.edge_budget) +
+                " cannot be met scaling to " + std::to_string(workers) + " workers at epoch " +
+                std::to_string(image_.next_epoch) + "; refusing to install the placement");
+        }
+        return std::move(*plan);
     }
 
     void apply_scale_only() {
@@ -262,7 +283,9 @@ private:
             throw std::logic_error("explicit scale is missing a transition");
         }
         const auto target = actions_.front().workers;
-        if (target == image_.placement.workers) {
+        // Without a budget a same-size transition is a no-op. With one it may
+        // still need to rebalance ownership, so fall through to planning.
+        if (!runtime_.edge_budget && target == image_.placement.workers) {
             return;
         }
         for (;;) {

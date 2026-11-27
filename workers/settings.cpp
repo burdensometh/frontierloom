@@ -26,6 +26,8 @@ void set_value(Settings& settings, std::string_view key, std::string_view value)
         settings.timeout = std::chrono::milliseconds(parse_number<std::uint32_t>(value, key));
     } else if (key == "retry_limit") {
         settings.retry_limit = parse_number<std::uint32_t>(value, key);
+    } else if (key == "edge_budget") {
+        settings.edge_budget = parse_number<std::uint64_t>(value, key);
     } else if (key == "damping") {
         settings.damping = parse_number<double>(value, key);
     } else if (key == "tolerance") {

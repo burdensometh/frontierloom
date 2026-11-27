@@ -139,6 +139,27 @@ void graph_suite(const std::filesystem::path& samples) {
     auto corrupted = initial;
     corrupted.owners[0] = 1;
     rejects([&] { corrupted.validate(8); }, "quotas");
+
+    // Budgeted replanning bounds every worker's predicted outgoing edges while
+    // keeping one owner per partition and deciding deterministically.
+    const auto budgeted = plan_scale_budgeted(shards, graph, initial, 4, 6);
+    check(budgeted.has_value(), "budget above shard peaks is feasible");
+    check(budgeted->target.owners.size() == shards.count(), "each partition has exactly one owner");
+    budgeted->target.validate(8);
+    const auto both = [&](const PartitionMap& placement) {
+        const auto loads = worker_edge_loads(shards, graph, placement);
+        return *std::max_element(loads.begin(), loads.end());
+    };
+    check(both(budgeted->target) <= 6, "planned workers respect the edge budget");
+    check(budgeted->moves.size() == 4, "budgeted plan moves only the shards it must");
+    const auto replay = plan_scale_budgeted(shards, graph, initial, 4, 6);
+    check(replay && replay->target == budgeted->target && replay->moves == budgeted->moves,
+          "same input produces the same allocation");
+    const auto equal_scores = plan_scale_budgeted(shards, graph, initial, 4, 8);
+    check(equal_scores && both(equal_scores->target) <= 8 &&
+          equal_scores->target.workers == 4, "generous budget stays within its bound");
+    const auto impossible = plan_scale_budgeted(shards, graph, initial, 4, 3);
+    check(!impossible.has_value(), "budget below every feasible peak is rejected");
 }
 
 void kernel_suite(const std::filesystem::path& samples) {
@@ -354,6 +375,36 @@ void engine_suite(const std::filesystem::path& samples) {
         check(moved.placement.workers == 4 && moved.next_epoch == 0 && moved.mailbox == disk.mailbox,
               "standalone scale moves ownership without consuming a frontier");
         check(verify_result(graph, resume(graph, store, Runtime{})).ok, "failed run can be resumed");
+    }
+    {
+        // The executed transition must be exactly the budgeted plan for the
+        // same checkpoint, target and budget, and an infeasible budget must not
+        // install any placement.
+        Store store(scratch.file("budget.flc"));
+        Runtime hold;
+        hold.stop_after = 0;
+        const auto seeded = compute(graph, store, start, hold);
+        const Shards budget_shards(graph, static_cast<Partition>(seeded.placement.owners.size()));
+        const auto expected = plan_scale_budgeted(budget_shards, graph, seeded.placement, 4, 6);
+        check(expected.has_value(), "budgeted plan for the seeded checkpoint is feasible");
+
+        Runtime bounded;
+        bounded.edge_budget = 6;
+        const auto scaled = rescale(graph, store, 4, bounded);
+        check(scaled.placement == expected->target &&
+              scaled.placement.generation == seeded.placement.generation + 1,
+              "execution installs the same allocation the plan displays");
+        const auto loads = worker_edge_loads(budget_shards, graph, scaled.placement);
+        check(*std::max_element(loads.begin(), loads.end()) <= 6,
+              "every worker stays within the edge budget");
+
+        Runtime too_tight;
+        too_tight.edge_budget = 3;
+        rejects([&] { (void)rescale(graph, store, 4, too_tight); }, "edge budget");
+        const auto after = store.load(graph);
+        check(after.placement == scaled.placement && after.next_epoch == scaled.next_epoch &&
+              after.placement.generation == scaled.placement.generation,
+              "refused budget leaves the committed placement intact");
     }
     {
         const auto rank_graph = load_graph(samples / "dangling.v1.graph");

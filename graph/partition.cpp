@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
+#include <optional>
 #include <stdexcept>
 
 namespace frontier {
@@ -122,6 +124,128 @@ ScalePlan plan_scale(const PartitionMap& current, Worker target_workers) {
         plan.target.owners[part] = recipient;
         --remaining[recipient];
         plan.moves.push_back({part, current.owner(part), recipient});
+    }
+    plan.target.validate(count);
+    return plan;
+}
+
+std::vector<std::uint64_t> worker_edge_loads(const Shards& shards, const Graph& graph,
+                                             const PartitionMap& placement) {
+    const auto count = static_cast<Partition>(placement.owners.size());
+    if (shards.count() != count) {
+        throw std::invalid_argument("shards do not match the placement partition count");
+    }
+    placement.validate(count);
+    std::vector<std::uint64_t> loads(placement.workers);
+    for (Partition part = 0; part < count; ++part) {
+        std::uint64_t edges{};
+        for (const auto vertex : shards.vertices(part)) {
+            edges += graph.outgoing(vertex).size();
+        }
+        loads.at(placement.owner(part)) += edges;
+    }
+    return loads;
+}
+
+std::optional<ScalePlan> plan_scale_budgeted(const Shards& shards, const Graph& graph,
+                                             const PartitionMap& current,
+                                             Worker target_workers, std::uint64_t edge_budget) {
+    const auto count = static_cast<Partition>(current.owners.size());
+    if (shards.count() != count) {
+        throw std::invalid_argument("shards do not match the placement partition count");
+    }
+    current.validate(count);
+    validate_counts(count, target_workers);
+
+    // Predicted work per shard is its outgoing edge count: every scatter along
+    // an edge costs one message, whether it stays local or crosses workers.
+    std::vector<std::uint64_t> cost(count);
+    for (Partition part = 0; part < count; ++part) {
+        for (const auto vertex : shards.vertices(part)) {
+            cost[part] += graph.outgoing(vertex).size();
+        }
+    }
+    const auto quota = quotas(count, target_workers);
+
+    // A shard that on its own exceeds the budget can never be placed.
+    for (const auto edges : cost) {
+        if (edges > edge_budget) {
+            return std::nullopt;
+        }
+    }
+
+    // Walk the heaviest shards first so the hardest placements are decided
+    // before capacity is consumed. Equal costs break by partition index so the
+    // result depends only on the input, never on iteration order.
+    auto order = std::vector<Partition>(count);
+    std::iota(order.begin(), order.end(), Partition{0});
+    std::sort(order.begin(), order.end(), [&](Partition left, Partition right) {
+        return cost[left] != cost[right] ? cost[left] > cost[right] : left < right;
+    });
+
+    // First pass: retain the current owner wherever it has quota and headroom.
+    // Remaining shards go to the least-loaded worker that can still take them,
+    // breaking ties by the lowest worker ID.
+    std::vector<Worker> owners(count, std::numeric_limits<Worker>::max());
+    std::vector<std::size_t> remaining = quota;
+    std::vector<std::uint64_t> load(target_workers);
+    for (const auto part : order) {
+        const auto former = current.owner(part);
+        if (former < target_workers && remaining[former] > 0 &&
+            load[former] + cost[part] <= edge_budget) {
+            owners[part] = former;
+            --remaining[former];
+            load[former] += cost[part];
+        }
+    }
+
+    const auto place_remainder = [&]() {
+        for (const auto part : order) {
+            if (owners[part] != std::numeric_limits<Worker>::max()) {
+                continue;
+            }
+            std::optional<Worker> pick;
+            for (Worker worker = 0; worker < target_workers; ++worker) {
+                if (remaining[worker] == 0 || load[worker] + cost[part] > edge_budget) {
+                    continue;
+                }
+                if (!pick || load[worker] < load[*pick]) {
+                    pick = worker;
+                }
+            }
+            if (!pick) {
+                return false;
+            }
+            owners[part] = *pick;
+            --remaining[*pick];
+            load[*pick] += cost[part];
+        }
+        return true;
+    };
+
+    if (!place_remainder()) {
+        // Retention-first can strand capacity; retry from an empty placement to
+        // decide feasibility purely from the budget and quotas.
+        owners.assign(count, std::numeric_limits<Worker>::max());
+        remaining = quota;
+        std::fill(load.begin(), load.end(), std::uint64_t{0});
+        if (!place_remainder()) {
+            return std::nullopt;
+        }
+    }
+
+    if (target_workers == current.workers && owners == current.owners) {
+        return ScalePlan{current, {}};
+    }
+
+    ScalePlan plan;
+    plan.target.generation = next_generation(current.generation);
+    plan.target.workers = target_workers;
+    plan.target.owners = owners;
+    for (Partition part = 0; part < count; ++part) {
+        if (owners[part] != current.owner(part)) {
+            plan.moves.push_back({part, current.owner(part), owners[part]});
+        }
     }
     plan.target.validate(count);
     return plan;

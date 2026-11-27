@@ -62,6 +62,8 @@ The partition count stays fixed across scaling. Partition assignment uses a stab
 
 `scale` applies a new placement at the checkpoint's current boundary. Repeat `--scale-at EPOCH:WORKERS` on compute or resume to schedule transitions before specific supersteps. The schedule belongs to that invocation. The `plan` command shows proposed moves and predicted cross-worker edges without opening a writer.
 
+`--edge-budget EDGES` bounds the work each worker may be assigned before a transition is installed. A worker's predicted workload is the sum of the outgoing edges of the shards it owns, since every such edge is scanned and scattered once per superstep whether the message stays local or crosses a worker. The planner walks the heaviest shards first, keeps each partition's current owner wherever the quota ladder and budget allow it, and resolves equal loads by partition then worker ID so the same checkpoint, target and budget always yield the same allocation. When no placement at the requested worker count satisfies the budget, both `plan` (reporting `status=infeasible`) and `scale`, `compute` and `resume` (exiting 2) refuse to install it and leave the committed placement untouched. The `plan` command and the engine share one planner, so `plan --edge-budget` predicts exactly the allocation and cross-worker edge count a subsequent `scale` publishes.
+
 | Point | Effect |
 | --- | --- |
 | `after-send:EPOCH[:WORKER]` | Kills the worker after its batch has been staged and before the worker can confirm it. |

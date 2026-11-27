@@ -41,6 +41,7 @@ struct Event {
     std::string detail;
     std::uint64_t staged{};
     std::uint64_t moved{};
+    std::uint64_t peak_edges{};
     std::uint32_t graceful{};
 };
 

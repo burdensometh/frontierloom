@@ -90,7 +90,7 @@ void print_event(std::ostream& output, const Event& event) {
                << " staged=" << event.staged;
     }
     if (event.kind == Event::Kind::scaled) {
-        output << " moved=" << event.moved;
+        output << " moved=" << event.moved << " peak_edges=" << event.peak_edges;
     }
     if (event.kind == Event::Kind::retired) {
         output << " graceful=" << event.graceful << " total=" << event.pids.size();

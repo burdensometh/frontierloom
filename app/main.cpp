@@ -88,15 +88,17 @@ void usage(std::ostream& out) {
     out << R"(FrontierLoom v1
   compute --graph FILE --checkpoint FILE --algorithm bfs|pagerank [options]
   resume --graph FILE --checkpoint FILE [options]
-  scale --graph FILE --checkpoint FILE --workers N [--config FILE] [--timeout-ms N] [--retry N]
+  scale --graph FILE --checkpoint FILE --workers N [--config FILE] [--timeout-ms N] [--retry N] [--edge-budget EDGES]
   inspect --graph FILE --checkpoint FILE [--vector FILE|-] [--verify] [--details] [--audit]
-  plan --graph FILE --checkpoint FILE --workers N
+  plan --graph FILE --checkpoint FILE --workers N [--edge-budget EDGES]
   reference --graph FILE --algorithm bfs|pagerank [program options] [--vector FILE|-]
   canonicalize --graph FILE --out FILE
 
 BFS requires --source ID. PageRank supports --damping D and --tolerance E.
 Both support --limit N and --config FILE.
 Compute accepts --partitions N and --workers N.
+Compute, resume and scale accept --edge-budget EDGES to bound each worker's
+predicted outgoing edges; a scale that cannot meet the budget is refused.
 Compute and resume accept --stop-after N, --scale-at EPOCH:WORKERS,
 --fault POINT:EPOCH[:WORKER], --timeout-ms N, --retry N, --vector FILE|-,
 --verify and --quiet. Repeat --scale-at and --fault for different boundaries.
@@ -130,6 +132,11 @@ Runtime runtime_from(Arguments& args, const Settings& settings, bool live) {
     runtime.timeout = std::chrono::milliseconds(
         args.number("--timeout-ms", static_cast<std::uint32_t>(settings.timeout.count())));
     runtime.retry_limit = args.number("--retry", settings.retry_limit);
+    if (const auto budget = args.single("--edge-budget")) {
+        runtime.edge_budget = parse_number<std::uint64_t>(*budget, "--edge-budget");
+    } else {
+        runtime.edge_budget = settings.edge_budget;
+    }
     if (live) {
         if (const auto count = args.single("--stop-after")) {
             runtime.stop_after = parse_number<std::uint32_t>(*count, "--stop-after");
@@ -235,8 +242,18 @@ int run(std::string_view command, Arguments& args) {
     if (command == "plan") {
         const auto path = args.need("--checkpoint");
         const auto workers = parse_number<Worker>(args.need("--workers"), "--workers");
+        const auto settings = settings_from(args);
+        const auto budget = args.single("--edge-budget");
         args.finish();
-        print_scale_plan(std::cout, graph, load_checkpoint(path, graph), workers);
+        const auto image = load_checkpoint(path, graph);
+        const auto limit = budget ? std::optional<std::uint64_t>(
+                            parse_number<std::uint64_t>(*budget, "--edge-budget"))
+                                  : settings.edge_budget;
+        if (limit) {
+            print_scale_plan(std::cout, graph, image, workers, *limit);
+        } else {
+            print_scale_plan(std::cout, graph, image, workers);
+        }
         return 0;
     }
     if (command == "reference") {

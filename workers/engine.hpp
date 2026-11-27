@@ -16,6 +16,7 @@ struct Runtime {
     std::chrono::milliseconds timeout{15000};
     std::uint32_t retry_limit{4};
     std::optional<std::uint32_t> stop_after;
+    std::optional<std::uint64_t> edge_budget;
     std::vector<ScaleAt> scaling;
     std::vector<Fault> faults;
 };

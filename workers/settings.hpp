@@ -11,6 +11,7 @@ struct Settings {
     Worker workers = 2;
     std::chrono::milliseconds timeout{15000};
     std::uint32_t retry_limit = 4;
+    std::optional<std::uint64_t> edge_budget;
     double damping = 0.85;
     double tolerance = 1e-10;
     std::uint32_t rank_limit = 100;
