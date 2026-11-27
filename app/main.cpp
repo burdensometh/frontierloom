@@ -91,6 +91,7 @@ void usage(std::ostream& out) {
   scale --graph FILE --checkpoint FILE --workers N [--config FILE] [--timeout-ms N] [--retry N]
   inspect --graph FILE --checkpoint FILE [--vector FILE|-] [--verify] [--details] [--audit]
   plan --graph FILE --checkpoint FILE --workers N
+  convert --graph FILE --checkpoint FILE
   reference --graph FILE --algorithm bfs|pagerank [program options] [--vector FILE|-]
   canonicalize --graph FILE --out FILE
 
@@ -100,6 +101,7 @@ Compute accepts --partitions N and --workers N.
 Compute and resume accept --stop-after N, --scale-at EPOCH:WORKERS,
 --fault POINT:EPOCH[:WORKER], --timeout-ms N, --retry N, --vector FILE|-,
 --verify and --quiet. Repeat --scale-at and --fault for different boundaries.
+Checkpoints publish as sharded V2 images; convert rewrites a V1 image in place.
 )";
 }
 
@@ -210,7 +212,8 @@ int mutable_command(std::string_view command, Arguments& args, const Graph& grap
 
 int run(std::string_view command, Arguments& args) {
     if (command != "compute" && command != "resume" && command != "scale" &&
-        command != "inspect" && command != "plan" && command != "reference" && command != "canonicalize") {
+        command != "inspect" && command != "plan" && command != "convert" &&
+        command != "reference" && command != "canonicalize") {
         throw std::invalid_argument("unknown command " + std::string(command));
     }
     const auto graph = load_graph(args.need("--graph"));
@@ -237,6 +240,16 @@ int run(std::string_view command, Arguments& args) {
         const auto workers = parse_number<Worker>(args.need("--workers"), "--workers");
         args.finish();
         print_scale_plan(std::cout, graph, load_checkpoint(path, graph), workers);
+        return 0;
+    }
+    if (command == "convert") {
+        const auto path = args.need("--checkpoint");
+        args.finish();
+        Store store(path);
+        const auto before = store.format();
+        store.convert(graph);
+        std::cerr << "convert from_format=v" << before << " to_format=v" << store.format()
+                  << " bytes=" << snapshot_bytes(path) << '\n';
         return 0;
     }
     if (command == "reference") {

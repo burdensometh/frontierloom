@@ -86,6 +86,12 @@ std::string read_bytes(const std::filesystem::path& path) {
     return bytes.str();
 }
 
+Generation file_generation(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    check(static_cast<bool>(input), "manifest cannot be opened");
+    return manifest_generation(input);
+}
+
 void graph_suite(const std::filesystem::path& samples) {
     const auto graph = campus(samples);
     check(graph.size() == 9 && graph.edge_count() == 13 && graph.revision() == 7,
@@ -282,6 +288,143 @@ void snapshot_suite(const std::filesystem::path& samples) {
     }
 }
 
+void shard_suite(const std::filesystem::path& samples) {
+    const auto graph = campus(samples);
+    const auto fixture_path = samples / "campus.epoch1.v1.flc";
+    const auto fixture = load_checkpoint(fixture_path, graph);
+    Scratch scratch;
+
+    // A V1 image converts in place to V2 and resumes to the same result as the
+    // V1 fixture would. Control state and resident data agree across formats.
+    const auto migrated = scratch.file("migrated.flc");
+    std::filesystem::copy_file(fixture_path, migrated);
+    {
+        Store store(migrated);
+        check(store.format() == checkpoint_format_v1, "stock fixture starts as v1");
+        const auto before = store.load(graph);
+        store.convert(graph);
+        check(store.format() == checkpoint_format_v2, "conversion produces a sharded v2 manifest");
+        check(store.load(graph) == before, "conversion preserves the committed image exactly");
+        check(std::filesystem::is_directory(shard_root(migrated)), "conversion creates the shard root");
+
+        // Converting twice lands on one byte-identical manifest and one
+        // generation directory, so there is a single visible target.
+        const auto manifest = read_bytes(migrated);
+        const auto generation = file_generation(migrated);
+        check(generation != 0, "v2 manifest records a generation digest");
+        store.convert(graph);
+        check(read_bytes(migrated) == manifest, "second conversion is byte-identical");
+        std::set<std::string> names;
+        for (const auto& entry : std::filesystem::directory_iterator(shard_root(migrated))) {
+            names.insert(entry.path().filename().string());
+        }
+        check(names == std::set<std::string>{generation_directory(generation)},
+              "both conversions share one visible generation directory");
+        check(store.load(graph) == before, "re-converted image is still readable");
+    }
+    {
+        Store store(migrated);
+        const auto finished = resume(graph, store, Runtime{});
+        check(finished.totals.resumes == 1 && verify_result(graph, finished).ok,
+              "a converted v1 fixture resumes to the verified result");
+    }
+
+    // Every shard of the live generation is required. Dropping one shard file
+    // makes the generation incomplete rather than silently mixing epochs.
+    const auto missing = scratch.file("missing.flc");
+    std::filesystem::copy_file(fixture_path, missing);
+    Digest live{};
+    {
+        Store store(missing);
+        store.convert(graph);
+        live = file_generation(missing);
+    }
+    const auto live_root = shard_root(missing) / generation_directory(live);
+    const auto victim = live_root / "part-0003.shard";
+    check(std::filesystem::exists(victim), "converted fixture has the expected shard file");
+    std::filesystem::rename(victim, scratch.file("part-0003.shard"));
+    rejects([&] { (void)load_checkpoint(missing, graph); }, "generation is incomplete");
+    std::filesystem::rename(scratch.file("part-0003.shard"), victim);
+    check(load_checkpoint(missing, graph) == fixture, "restoring the shard restores the image");
+
+    // A shard whose bytes disagree with the manifest checksum is rejected even
+    // when every file is present, catching a half-written shard of a newer
+    // generation that reused a manifest entry.
+    {
+        auto bytes = read_bytes(victim);
+        bytes[bytes.size() / 2] = bytes[bytes.size() / 2] == '0' ? '1' : '0';
+        const auto saved = read_bytes(victim);
+        std::ofstream output(victim, std::ios::binary | std::ios::trunc);
+        output << bytes;
+        output.close();
+        rejects([&] { (void)load_checkpoint(missing, graph); }, "checksum");
+        std::ofstream restore(victim, std::ios::binary | std::ios::trunc);
+        restore << saved;
+    }
+
+    // A stray directory holding a partial, unreferenced generation never
+    // disturbs reading the live one.
+    {
+        const auto stray = shard_root(missing) / "g0123456789abcdef";
+        std::filesystem::create_directories(stray);
+        std::ofstream(stray / "part-0000.shard") << "partial generation\n";
+        check(load_checkpoint(missing, graph) == fixture,
+              "an unreferenced half-written generation is ignored");
+        std::filesystem::remove_all(stray);
+    }
+
+    // Publishing a newer image stages a fresh generation directory before the
+    // manifest rename. The previous generation is still retained, so restoring
+    // the old manifest recovers exactly the previous committed state even after
+    // the newer shards exist on disk.
+    {
+        const auto live_path = scratch.file("live.flc");
+        Store store(live_path);
+        Runtime paused;
+        paused.stop_after = 1;
+        const auto epoch1 = compute(graph, store, {bfs(), 8, 2}, paused);
+        check(epoch1.next_epoch == 1, "paused after one commit");
+        const auto epoch1_generation = file_generation(live_path);
+        const auto epoch1_manifest = read_bytes(live_path);
+
+        const Shards shards(graph, 8);
+        // A recovery publishes the same cursor under a fresh incarnation, which
+        // is a complete, valid image with a new generation digest.
+        auto recovered = epoch1;
+        recovered.incarnation = next_generation(recovered.incarnation);
+        store.publish(graph, shards, recovered);
+        const auto epoch2_generation = file_generation(live_path);
+        check(epoch2_generation != epoch1_generation, "a new image names a new generation");
+        check(std::filesystem::exists(shard_root(live_path) / generation_directory(epoch1_generation)),
+              "previous generation is retained after the new image is published");
+        check(store.load(graph) == recovered, "the new image reads back");
+        check(snapshot_bytes(live_path) > read_bytes(live_path).size(),
+              "snapshot size accounts for shard files");
+
+        // Rewinding only the manifest to the previous generation recovers the
+        // previous committed state without touching the newer shard files.
+        std::ofstream(live_path, std::ios::binary | std::ios::trunc) << epoch1_manifest;
+        check(store.load(graph) == epoch1,
+              "the previous manifest still reads the previous complete state");
+    }
+
+    // The in-memory shard serialization is deterministic and validates against
+    // the same control image that produced it.
+    {
+        const Shards shards(graph, 8);
+        const auto shards_on_disk = serialize_shards(shards, fixture);
+        check(shards_on_disk.size() == 8, "one shard file per partition");
+        check(checkpoint_generation(fixture, shards_on_disk) ==
+              checkpoint_generation(fixture, shards_on_disk),
+              "generation digest is stable for one image");
+        auto reordered = shards_on_disk;
+        std::swap(reordered.front(), reordered.back());
+        check(checkpoint_generation(fixture, reordered) !=
+              checkpoint_generation(fixture, shards_on_disk),
+              "generation digest binds shard order");
+    }
+}
+
 void engine_suite(const std::filesystem::path& samples) {
     const auto graph = campus(samples);
     Scratch scratch;
@@ -391,7 +534,7 @@ int main(int argc, char** argv) {
     using Suite = void (*)(const std::filesystem::path&);
     const std::map<std::string, Suite> suites{
         {"graph", graph_suite}, {"kernel", kernel_suite}, {"exchange", exchange_suite},
-        {"snapshot", snapshot_suite}, {"engine", engine_suite}
+        {"snapshot", snapshot_suite}, {"shard", shard_suite}, {"engine", engine_suite}
     };
     try {
         if (argc != 3 || !suites.contains(argv[1])) {

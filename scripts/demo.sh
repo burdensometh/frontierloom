@@ -35,6 +35,13 @@ cp "$root/samples/campus.epoch1.v1.flc" "$output/fixture.flc"
     --verify --vector "$output/fixture.csv"
 cmp "$output/bfs.csv" "$output/fixture.csv"
 
+cp "$root/samples/campus.epoch1.v1.flc" "$output/legacy.flc"
+"$cli" convert --graph "$campus" --checkpoint "$output/legacy.flc"
+"$cli" resume --graph "$campus" --checkpoint "$output/legacy.flc" \
+    --verify --vector "$output/legacy.csv"
+cmp "$output/bfs.csv" "$output/legacy.csv"
+"$cli" convert --graph "$campus" --checkpoint "$output/legacy.flc"
+
 "$cli" compute --graph "$dangling" --checkpoint "$output/rank.flc" --config "$config" \
     --algorithm pagerank --workers 3 --stop-after 5
 "$cli" plan --graph "$dangling" --checkpoint "$output/rank.flc" --workers 1

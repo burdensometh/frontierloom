@@ -125,7 +125,7 @@ Trial compute_trial(const Graph& graph, const std::filesystem::path& path,
     trial = describe(graph, finished);
     trial.elapsed = elapsed;
     trial.peak_width = max_frontier;
-    trial.bytes = std::filesystem::file_size(path);
+    trial.bytes = snapshot_bytes(path);
     return trial;
 }
 
@@ -208,7 +208,7 @@ void run_benchmarks(const Options& options) {
     }
 
     Repeats restore("recovery-read");
-    const auto bytes = std::filesystem::file_size(checkpoint);
+    const auto bytes = snapshot_bytes(checkpoint);
     for (std::uint32_t trial = 0; trial < options.repeats; ++trial) {
         const auto begin = Clock::now();
         const auto image = load_checkpoint(checkpoint, hub);

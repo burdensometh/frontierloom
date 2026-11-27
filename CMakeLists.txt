@@ -50,7 +50,7 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(frontier-tests tests/main.cpp)
     target_link_libraries(frontier-tests PRIVATE frontier_core)
-    foreach(suite graph kernel exchange snapshot engine)
+    foreach(suite graph kernel exchange snapshot shard engine)
         add_test(NAME "${suite}"
             COMMAND frontier-tests "${suite}" "${CMAKE_CURRENT_SOURCE_DIR}/samples")
         set_tests_properties("${suite}" PROPERTIES TIMEOUT 45)

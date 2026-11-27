@@ -5,10 +5,12 @@
 #include <fcntl.h>
 #include <fstream>
 #include <locale>
+#include <set>
 #include <sstream>
 #include <sys/file.h>
 #include <system_error>
 #include <unistd.h>
+#include <vector>
 
 namespace frontier {
 namespace {
@@ -53,46 +55,58 @@ void persist(int fd, std::string_view bytes) {
             continue;
         }
         if (count < 0) {
-            fail_os("writing checkpoint temporary file");
+            fail_os("writing checkpoint file");
         }
         if (count == 0) {
             throw std::runtime_error("checkpoint write made no progress");
         }
         bytes.remove_prefix(static_cast<std::size_t>(count));
     }
-    sync(fd, "syncing checkpoint temporary file");
+    sync(fd, "syncing checkpoint file");
 }
 
-class Temporary {
-public:
-    explicit Temporary(const std::filesystem::path& checkpoint)
-        : path_(checkpoint.string() + ".tmp.XXXXXX"), fd_(::mkostemp(path_.data(), O_CLOEXEC)) {
-        if (fd_.get() < 0) {
-            fail_os("creating checkpoint temporary file");
-        }
+// Writes `bytes` to a uniquely named temporary file in `directory` and syncs it.
+std::filesystem::path stage_file(const std::filesystem::path& directory, std::string_view bytes) {
+    auto path = (directory / "stage.XXXXXX").string();
+    Descriptor fd(::mkostemp(path.data(), O_CLOEXEC));
+    if (fd.get() < 0) {
+        fail_os("creating checkpoint temporary file");
     }
-
-    ~Temporary() {
-        if (!path_.empty()) {
-            (void)::unlink(path_.c_str());
-        }
+    persist(fd.get(), bytes);
+    if (::close(fd.release()) < 0) {
+        fail_os("closing checkpoint temporary file");
     }
+    return path;
+}
 
-    void replace(const std::filesystem::path& checkpoint, std::string_view bytes) {
-        persist(fd_.get(), bytes);
-        if (::close(fd_.release()) < 0) {
-            fail_os("closing checkpoint temporary file");
-        }
-        if (::rename(path_.c_str(), checkpoint.c_str()) < 0) {
-            fail_os("publishing checkpoint");
-        }
-        path_.clear();
+void sync_directory(const std::filesystem::path& directory) {
+    Descriptor fd(::open(directory.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY));
+    if (fd.get() < 0) {
+        fail_os("opening a checkpoint directory");
     }
+    sync(fd.get(), "syncing a checkpoint directory");
+}
 
-private:
-    std::string path_;
-    Descriptor fd_;
-};
+// Publishes `bytes` as the manifest at `target`: stage, sync, atomically rename
+// over the destination, then sync the destination directory.
+void publish_file(const std::filesystem::path& target, std::string_view bytes) {
+    const auto temporary = stage_file(target.parent_path(), bytes);
+    if (::rename(temporary.c_str(), target.c_str()) < 0) {
+        const auto error = errno;
+        (void)::unlink(temporary.c_str());
+        errno = error;
+        fail_os("publishing checkpoint");
+    }
+    sync_directory(target.parent_path());
+}
+
+std::string render_manifest(const Checkpoint& checkpoint, Generation generation,
+                            Generation previous, std::span<const ShardFile> shards) {
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    write_manifest_v2(stream, checkpoint, generation, previous, shards);
+    return std::move(stream).str();
+}
 
 }  // namespace
 
@@ -101,7 +115,7 @@ Checkpoint load_checkpoint(const std::filesystem::path& file, const Graph& graph
     if (!input) {
         throw std::runtime_error("cannot open checkpoint " + file.string());
     }
-    return read_checkpoint_v1(input, graph);
+    return read_checkpoint(input, file, graph);
 }
 
 Store::Store(std::filesystem::path file) {
@@ -153,21 +167,97 @@ Checkpoint Store::load(const Graph& graph) const {
     return load_checkpoint(file_, graph);
 }
 
+std::uint32_t Store::format() const {
+    std::ifstream input(file_, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open checkpoint " + file_.string());
+    }
+    std::string head;
+    char line[64];
+    if (!input.getline(line, sizeof(line))) {
+        throw std::invalid_argument("checkpoint header is empty");
+    }
+    head = line;
+    if (head == "FRONTIERLOOM_CHECKPOINT 2") {
+        return checkpoint_format_v2;
+    }
+    if (head == "FRONTIERLOOM_CHECKPOINT 1") {
+        return checkpoint_format_v1;
+    }
+    throw std::invalid_argument("checkpoint header is not a supported format");
+}
+
 void Store::publish(const Graph& graph, const Shards& shards, const Checkpoint& checkpoint) const {
     checkpoint.validate(graph, shards);
     (void)exists();
-    std::ostringstream stream;
-    stream.imbue(std::locale::classic());
-    write_checkpoint_v1(stream, checkpoint);
-    auto bytes = std::move(stream).str();
+    const auto shards_on_disk = serialize_shards(shards, checkpoint);
+    const auto generation = checkpoint_generation(checkpoint, shards_on_disk);
 
-    Descriptor directory(::open(file_.parent_path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY));
-    if (directory.get() < 0) {
-        fail_os("opening the checkpoint directory");
+    // Stage every shard of the candidate generation first. If the process dies
+    // here the manifest still names the previous complete generation, and the
+    // half-written directory is named after an unreferenced digest.
+    const auto root = shard_root(file_);
+    const auto directory = root / generation_directory(generation);
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) {
+        throw std::system_error(error, "creating checkpoint generation directory");
     }
-    Temporary temporary(file_);
-    temporary.replace(file_, bytes);
-    sync(directory.get(), "checkpoint renamed but directory sync failed");
+    for (const auto& shard : shards_on_disk) {
+        publish_file(shard_path(root, generation, shard.partition), shard.payload);
+    }
+    sync_directory(directory);
+    sync_directory(root);
+
+    // The manifest rename is the single atomic commit point for the generation.
+    Generation previous{};
+    if (exists()) {
+        std::ifstream current(file_, std::ios::binary);
+        if (current) {
+            previous = manifest_generation(current);
+        }
+    }
+    if (previous == generation) {
+        // Re-publishing identical content (e.g. converting twice) keeps one
+        // visible generation rather than recording itself as its predecessor.
+        previous = 0;
+    }
+    publish_file(file_, render_manifest(checkpoint, generation, previous, shards_on_disk));
+
+    // Reclaim shard directories neither the manifest nor its predecessor names.
+    // The previous generation is intentionally retained so a reader that loaded
+    // the old manifest just before the rename still finds one complete image.
+    std::set<std::string> live;
+    live.insert(generation_directory(generation));
+    if (previous != 0) {
+        live.insert(generation_directory(previous));
+    }
+    std::vector<std::filesystem::path> dead;
+    std::filesystem::directory_iterator entries(root, error);
+    if (!error) {
+        for (const auto& entry : entries) {
+            const auto name = entry.path().filename().string();
+            if (!live.contains(name)) {
+                dead.push_back(entry.path());
+            }
+        }
+    }
+    for (const auto& path : dead) {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+}
+
+void Store::convert(const Graph& graph) const {
+    if (!exists()) {
+        throw std::runtime_error("checkpoint does not exist");
+    }
+    const auto image = load(graph);
+    const auto shards = Shards(graph, static_cast<Partition>(image.placement.owners.size()));
+    // Republishing is deterministic: a V2 input is re-staged under the same
+    // content-addressed generation and its manifest is unchanged, so converting
+    // twice yields a single visible target.
+    publish(graph, shards, image);
 }
 
 }  // namespace frontier

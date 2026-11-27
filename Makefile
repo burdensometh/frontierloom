@@ -11,7 +11,7 @@ CLI_OBJ := $(BUILD)/app/main.o $(BUILD)/app/inspection.o
 BENCH_OBJ := $(BUILD)/app/bench.o
 TEST_OBJ := $(BUILD)/tests/main.o
 DEPENDENCIES := $(CORE_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
-SUITES := graph kernel exchange snapshot engine
+SUITES := graph kernel exchange snapshot shard engine
 
 .PHONY: all check demo bench
 all: $(BUILD)/frontierloom $(BUILD)/frontier-bench

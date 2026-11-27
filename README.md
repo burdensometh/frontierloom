@@ -1,6 +1,6 @@
 # FrontierLoom
 
-FrontierLoom runs bulk-synchronous BFS and PageRank over directed graphs. A Linux coordinator assigns fixed graph partitions to forked worker processes. Workers calculate vertex state and scatter messages over Unix socket pairs. The coordinator seals the next inbox only after every partition acknowledges its batch, then publishes a v1 checkpoint.
+FrontierLoom runs bulk-synchronous BFS and PageRank over directed graphs. A Linux coordinator assigns fixed graph partitions to forked worker processes. Workers calculate vertex state and scatter messages over Unix socket pairs. The coordinator seals the next inbox only after every partition acknowledges its batch, then publishes a checkpoint. Checkpoints are written as sharded V2 images: a small manifest plus one file per partition, so a half-saved snapshot still exposes the previous complete state. V1 images remain readable and can be converted in place.
 
 ## Build and run
 
@@ -39,9 +39,14 @@ build/frontierloom scale --graph samples/campus.v1.graph \
 
 build/frontierloom resume --graph samples/campus.v1.graph \
   --checkpoint runs/campus.flc --verify --vector -
+
+build/frontierloom convert --graph samples/campus.v1.graph \
+  --checkpoint runs/campus.flc
 ```
 
 Each successful commit advances the persisted cursor by one superstep. `--stop-after` counts commits in the current invocation. `--stop-after 0` on a new run writes the initial image. Resume reads the graph identity, partition map, algorithm, tuning parameters, state and pending messages from the committed image. A failed compute with an existing snapshot can be continued through the same resume entry point.
+
+A checkpoint is a sharded V2 image: a manifest at the checkpoint path and one shard file per partition under `<checkpoint>.shards/<generation>/`. Publication writes and syncs every shard first, then atomically renames the new manifest into place, so the manifest is the single commit point. If only some shard files of a new generation are saved, the manifest still names the previous generation and reading returns the previous complete state. Graph identity, the superstep cursor and the pending inbox come only from the manifest; resident vertex state comes only from the shards that generation names. A missing, corrupt or cross-generation shard is rejected as an incomplete image, never silently mixed. `convert` rewrites any checkpoint, including a stock V1 image, as V2; converting twice recomputes the same content-addressed generation and leaves one visible target.
 
 ```sh
 build/frontierloom compute --graph samples/dangling.v1.graph \
@@ -79,7 +84,7 @@ Fault directives are one-shot per invocation. Worker IDs start at zero. The defa
 | `kernel/` | BFS, PageRank, vertex and contribution contracts, independent serial solver |
 | `mailbox/` | Attempt-scoped stage and confirm, deterministic destination reductions |
 | `barrier/` | Complete receipt set, message waterlines, progress and stopping |
-| `checkpoint/` | V1 codec, durable publication, writer lock and offline audit |
+| `checkpoint/` | V1 codec, sharded V2 publication and conversion, durable writer lock and offline audit |
 | `workers/` | Linux process supervision, framed transport, retries, migration and metrics |
 
 The graph, checkpoint and seed fixture contracts are documented in [v1 formats](docs/v1.md). The operator sample contains a cycle, a self-loop, a converging BFS frontier and an isolated vertex. The PageRank sample includes a dangling vertex. The benchmark uses deterministic high-out-degree PageRank and sparse-frontier BFS inputs, verifies each vector, then times warm checkpoint parsing and performs a real resume. Timing includes regular checkpoint publication for compute cases. Recovery-read timing covers parsing and validation from a file in the OS cache.
