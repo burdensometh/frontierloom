@@ -47,6 +47,10 @@ struct Mailbox {
 
 [[nodiscard]] bool valid_message(Algorithm algorithm, double value);
 [[nodiscard]] Digest batch_digest(const MessageBatch& batch);
+// Streaming digest for chunked delivery: the message total is only known once
+// the bounded chunk stream finishes, so it is folded in last instead of before
+// the messages. The distinct domain string keeps it separate from batch_digest.
+[[nodiscard]] Digest streaming_batch_digest(const MessageBatch& batch);
 [[nodiscard]] Digest mailbox_digest(const Mailbox& mailbox);
 
 class Sum {
@@ -57,6 +61,20 @@ public:
 private:
     double sum_{};
     double correction_{};
+};
+
+// Incremental digest matching streaming_batch_digest. A worker feeds each
+// bounded chunk as it leaves, so the digest never needs the whole degree-sized
+// message stream resident; the total is folded in when the stream closes.
+class BatchDigester {
+public:
+    BatchDigester(Epoch epoch, const WorkerAttempt& attempt, Partition partition);
+    void add(const Message& message);
+    void add(std::span<const Message> messages);
+    [[nodiscard]] Digest finish(std::uint64_t total) const;
+
+private:
+    Hash hash_;
 };
 
 }  // namespace frontier

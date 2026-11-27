@@ -180,6 +180,52 @@ void kernel_suite(const std::filesystem::path& samples) {
     auto damaged = image.work(part, 0);
     damaged.inbox.push_back(damaged.inbox.front());
     rejects([&] { (void)run_partition(graph, shards, program, {0, 1, 1}, damaged); }, "invalid");
+
+    // Bounded outbound buffer: a high-out-degree hub must be carried by many
+    // fixed-capacity chunks rather than one degree-sized buffer. Every chunk
+    // stays within the capacity, sequences are contiguous, exactly one chunk is
+    // flagged last, and reassembly reproduces the full ordered batch bit for bit.
+    {
+        constexpr std::size_t hub_vertices = 1200;
+        GraphInput hub_input;
+        hub_input.revision = 11;
+        hub_input.vertices.reserve(hub_vertices);
+        for (std::size_t vertex = 0; vertex < hub_vertices; ++vertex) {
+            hub_input.vertices.push_back(vertex);
+        }
+        hub_input.edges.reserve(hub_vertices - 1);
+        for (VertexId target = 1; target < hub_vertices; ++target) {
+            hub_input.edges.emplace_back(0, target);
+        }
+        const Graph hub(std::move(hub_input));
+        const Shards hub_shards(hub, 4);
+        auto hub_program = pagerank();
+        const auto hub_image = bootstrap(hub, hub_shards, hub_program, 2);
+        const auto hub_part = hub_shards.shard(0);
+        const auto full = run_partition(hub, hub_shards, hub_program, {0, 1, 1},
+                                        hub_image.work(hub_part, 0));
+
+        constexpr std::size_t small_capacity = 7;
+        std::vector<Message> rebuilt;
+        std::uint32_t expected_sequence{};
+        std::uint32_t last_count{};
+        const auto streamed = run_partition_streamed(
+            hub, hub_shards, hub_program, {0, 1, 1}, hub_image.work(hub_part, 0),
+            small_capacity, [&](std::uint32_t sequence, bool last, MessageChunk chunk) {
+                check(sequence == expected_sequence, "chunk sequences are contiguous");
+                check(chunk.size() <= small_capacity, "single outbound buffer stays bounded");
+                check(sequence != 0 || !rebuilt.empty() || true, "stream may open with any chunk");
+                last_count += last ? 1U : 0U;
+                rebuilt.insert(rebuilt.end(), chunk.begin(), chunk.end());
+                ++expected_sequence;
+            });
+        check(last_count == 1, "exactly one chunk closes the partition stream");
+        check(streamed.chunks == expected_sequence, "reported chunk count matches the stream");
+        check(streamed.stats.emitted == full.batch.messages.size(),
+              "streamed emission count equals the materialized batch");
+        check(rebuilt == full.batch.messages, "chunk reassembly reproduces the ordered batch");
+        check(streamed.chunks > 1, "a high-degree vertex spans multiple bounded chunks");
+    }
 }
 
 void exchange_suite(const std::filesystem::path&) {

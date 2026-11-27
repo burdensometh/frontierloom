@@ -15,6 +15,10 @@ namespace {
 
 constexpr std::uint32_t magic = 0x314d4c46U;
 
+// Hard ceiling on a single outbound buffer. It deliberately stays far below the
+// 96 MiB frame limit so no vertex degree can inflate one frame or one allocation.
+constexpr std::uint32_t chunk_message_limit = 4096U;
+
 [[noreturn]] void fail(std::string_view action) {
     const auto error = errno;
     throw Failure(std::string(action) + ": " + std::strerror(error));
@@ -60,6 +64,29 @@ void encode_stats(Encoder& out, const StepStats& stats) {
 
 StepStats decode_stats(Decoder& in) {
     return {in.u64(), in.u64(), in.u64(), in.real(), in.real(), in.real()};
+}
+
+void encode_messages(Encoder& out, std::span<const Message> messages) {
+    out.u32(static_cast<std::uint32_t>(messages.size()));
+    for (const auto& message : messages) {
+        out.u32(message.source);
+        out.u32(message.target);
+        out.real(message.value);
+    }
+}
+
+std::vector<Message> decode_messages(Decoder& in, const Graph& graph) {
+    const auto count = in.u32();
+    validate_count(count, chunk_message_limit, 16, in);
+    if (count > graph.edge_count()) {
+        throw Failure("message chunk exceeds the graph edge count");
+    }
+    std::vector<Message> messages;
+    messages.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        messages.push_back({in.u32(), in.u32(), in.real()});
+    }
+    return messages;
 }
 
 std::size_t vertex_count(const Shards& shards, Partition part) {
@@ -303,36 +330,47 @@ StepInput decode_work(Decoder& in, const Graph&, const Shards& shards) {
     return work;
 }
 
-void encode(Encoder& out, const PartitionResult& result) {
-    const auto& batch = result.batch;
-    out.u64(batch.epoch);
-    encode(out, batch.attempt);
-    out.u32(batch.source_partition);
-    encode_states(out, result.states);
-    encode_stats(out, result.stats);
-    out.u32(static_cast<std::uint32_t>(batch.messages.size()));
-    for (const auto& message : batch.messages) {
-        out.u32(message.source);
-        out.u32(message.target);
-        out.real(message.value);
+void encode(Encoder& out, const BatchChunk& chunk) {
+    if (chunk.messages.size() > chunk_message_limit) {
+        throw Failure("message chunk exceeds the outbound buffer limit");
     }
+    out.u64(chunk.epoch);
+    encode(out, chunk.attempt);
+    out.u32(chunk.source_partition);
+    out.u32(chunk.sequence);
+    out.u32(chunk.last ? 1U : 0U);
+    out.u32(static_cast<std::uint32_t>(chunk.states.size()));
+    if (chunk.last) {
+        // A partition may own no vertices, in which case an empty state image
+        // is the correct and complete payload for its single closing chunk.
+        encode_states(out, chunk.states);
+        encode_stats(out, chunk.stats);
+    } else if (!chunk.states.empty()) {
+        throw Failure("only the closing message chunk may carry partition state");
+    }
+    encode_messages(out, chunk.messages);
 }
 
-PartitionResult decode_result(Decoder& in, const Graph& graph, const Shards& shards) {
-    PartitionResult result;
-    auto& batch = result.batch;
-    batch.epoch = in.u64();
-    batch.attempt = decode_attempt(in);
-    batch.source_partition = in.u32();
-    result.states = decode_states(in, vertex_count(shards, batch.source_partition));
-    result.stats = decode_stats(in);
-    const auto messages = in.u32();
-    validate_count(messages, graph.edge_count(), 16, in);
-    batch.messages.reserve(messages);
-    for (std::uint32_t i = 0; i < messages; ++i) {
-        batch.messages.push_back({in.u32(), in.u32(), in.real()});
-    }
-    return result;
+DecodedChunk decode_chunk(Decoder& in, const Graph& graph, const Shards& shards) {
+    DecodedChunk chunk;
+    chunk.epoch = in.u64();
+    chunk.attempt = decode_attempt(in);
+    chunk.source_partition = in.u32();
+    chunk.sequence = in.u32();
+    chunk.last = in.u32() != 0U;
+    const auto state_count = in.u32();
+    const auto vertices = vertex_count(shards, chunk.source_partition);
+    if (chunk.last) {
+        if (state_count != vertices) {
+            throw Failure("closing message chunk is missing partition state");
+        }
+        chunk.states = decode_states(in, vertices);
+        chunk.stats = decode_stats(in);
+        chunk.has_payload = true;
+    } else if (state_count != 0) {
+        throw Failure("only the closing message chunk may carry partition state");
+    }    chunk.messages = decode_messages(in, graph);
+    return chunk;
 }
 
 void encode(Encoder& out, const BarrierReceipt& receipt) {

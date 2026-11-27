@@ -68,7 +68,7 @@ Digest Exchange::stage(MessageBatch batch) {
     }
     verify_source(batch.source_partition, batch.attempt);
     validate_messages(batch);
-    const auto digest = batch_digest(batch);
+    const auto digest = streaming_batch_digest(batch);
     auto& slot = slots_.at(batch.source_partition);
     if (slot) {
         if (slot->digest == digest && slot->batch.messages == batch.messages) {

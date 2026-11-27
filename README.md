@@ -77,7 +77,7 @@ Fault directives are one-shot per invocation. Worker IDs start at zero. The defa
 | --- | --- |
 | `graph/` | Canonical manifest, forward and reverse adjacency, graph identity, deterministic placement and load measurement |
 | `kernel/` | BFS, PageRank, vertex and contribution contracts, independent serial solver |
-| `mailbox/` | Attempt-scoped stage and confirm, deterministic destination reductions |
+| `mailbox/` | Attempt-scoped stage and confirm, deterministic destination reductions, fixed-capacity chunked scatter that bounds each outbound buffer independently of vertex degree |
 | `barrier/` | Complete receipt set, message waterlines, progress and stopping |
 | `checkpoint/` | V1 codec, durable publication, writer lock and offline audit |
 | `workers/` | Linux process supervision, framed transport, retries, migration and metrics |

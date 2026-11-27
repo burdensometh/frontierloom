@@ -3,68 +3,51 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace frontier {
 namespace {
 
-void add_messages(const Graph& graph, Vertex source, double value, MessageBatch& batch) {
-    for (const auto target : graph.outgoing(source)) {
-        batch.messages.push_back({source, target, value});
+// Bounds the outbound buffer: messages accumulate only until the fixed capacity
+// is reached, then the full chunk leaves the worker and the buffer restarts.
+// Vertex degree therefore changes the number of chunks, never their size.
+class SourceSink {
+public:
+    SourceSink(std::size_t capacity, const EmitChunk& emit) : capacity_(capacity), emit_(emit) {
+        buffer_.reserve(capacity_);
     }
-}
 
-void run_bfs(const Graph& graph, std::span<const Vertex> members, const StepInput& input,
-             PartitionResult& result) {
-    for (const auto& message : input.inbox) {
-        const auto member = std::lower_bound(members.begin(), members.end(), message.target);
-        auto& state = result.states[static_cast<std::size_t>(member - members.begin())];
-        const auto distance = static_cast<std::uint32_t>(message.value);
-        if (state.distance <= distance) {
-            continue;
-        }
-        state.distance = distance;
-        ++result.stats.active;
-        add_messages(graph, message.target, static_cast<double>(distance) + 1.0, result.batch);
-    }
-}
+    void source(Vertex vertex) { source_ = vertex; }
 
-void run_rank(const Graph& graph, std::span<const Vertex> members, const Program& program,
-              const StepInput& input, PartitionResult& result) {
-    const auto count = static_cast<double>(graph.size());
-    const auto teleport = (1.0 - program.damping) / count;
-    const auto redistributed = input.dangling / count;
-    auto next_message = input.inbox.begin();
-    Sum dangling;
-    Sum residual;
-    Sum rank_mass;
-    for (std::size_t index = 0; index < members.size(); ++index) {
-        const auto source = members[index];
-        const auto previous = result.states[index].rank;
-        double rank = previous;
-        if (input.epoch > 0) {
-            double received{};
-            if (next_message != input.inbox.end() && next_message->target == source) {
-                received = next_message->value;
-                ++next_message;
-            }
-            rank = teleport + program.damping * (received + redistributed);
-            residual.add(std::abs(rank - previous));
-        }
-
-        result.states[index].rank = rank;
-        rank_mass.add(rank);
-        const auto degree = graph.outgoing(source).size();
-        if (degree == 0) {
-            dangling.add(rank);
-        } else {
-            add_messages(graph, source, rank / static_cast<double>(degree), result.batch);
+    void add(Vertex target, double value) {
+        buffer_.push_back({source_, target, value});
+        ++emitted_;
+        if (buffer_.size() == capacity_) {
+            emit_(sequence_, false, buffer_);
+            ++sequence_;
+            buffer_.clear();
         }
     }
-    result.stats.active = members.size();
-    result.stats.dangling = dangling.value();
-    result.stats.residual = residual.value();
-    result.stats.rank_mass = rank_mass.value();
-}
+
+    // Emits the trailing chunk (even when empty) flagged as the stream end, so
+    // every partition produces a closed, non-empty chunk stream.
+    void finish() {
+        emit_(sequence_, true, buffer_);
+        ++sequence_;
+        buffer_.clear();
+    }
+
+    [[nodiscard]] std::uint32_t chunks() const { return sequence_; }
+    [[nodiscard]] std::uint64_t emitted() const { return emitted_; }
+
+private:
+    Vertex source_{};
+    std::size_t capacity_;
+    const EmitChunk& emit_;
+    std::vector<Message> buffer_;
+    std::uint32_t sequence_{};
+    std::uint64_t emitted_{};
+};
 
 }  // namespace
 
@@ -179,23 +162,156 @@ void validate_step_input(const Graph& graph, const Shards& shards,
     }
 }
 
-PartitionResult run_partition(const Graph& graph, const Shards& shards, const Program& program,
-                              const WorkerAttempt& attempt, const StepInput& input) {
+StreamedPartition settle_partition(const Graph& graph, const Shards& shards,
+                                   const Program& program, const WorkerAttempt& attempt,
+                                   const StepInput& input) {
+    (void)attempt;
     validate_step_input(graph, shards, program, input);
-    PartitionResult result;
-    result.states = input.states;
-    result.batch = {input.epoch, attempt, input.partition, {}};
-    result.stats.consumed = input.inbox.size();
+    StreamedPartition streamed;
+    streamed.states = input.states;
+    streamed.stats.consumed = input.inbox.size();
     const auto members = shards.vertices(input.partition);
+
+    // Settle every vertex state and the step statistics. No scatter buffer is
+    // allocated here, so this phase cannot grow with a vertex degree.
     switch (program.algorithm) {
     case Algorithm::bfs:
-        run_bfs(graph, members, input, result);
+        for (const auto& message : input.inbox) {
+            const auto member = std::lower_bound(members.begin(), members.end(), message.target);
+            auto& state = streamed.states[static_cast<std::size_t>(member - members.begin())];
+            const auto distance = static_cast<std::uint32_t>(message.value);
+            if (state.distance <= distance) {
+                continue;
+            }
+            state.distance = distance;
+            ++streamed.stats.active;
+        }
         break;
-    case Algorithm::pagerank:
-        run_rank(graph, members, program, input, result);
+    case Algorithm::pagerank: {
+        const auto count = static_cast<double>(graph.size());
+        const auto teleport = (1.0 - program.damping) / count;
+        const auto redistributed = input.dangling / count;
+        auto next_message = input.inbox.begin();
+        Sum dangling;
+        Sum residual;
+        Sum rank_mass;
+        for (std::size_t index = 0; index < members.size(); ++index) {
+            const auto vertex = members[index];
+            const auto previous = streamed.states[index].rank;
+            double rank = previous;
+            if (input.epoch > 0) {
+                double received{};
+                if (next_message != input.inbox.end() && next_message->target == vertex) {
+                    received = next_message->value;
+                    ++next_message;
+                }
+                rank = teleport + program.damping * (received + redistributed);
+                residual.add(std::abs(rank - previous));
+            }
+            streamed.states[index].rank = rank;
+            rank_mass.add(rank);
+            if (graph.outgoing(vertex).empty()) {
+                dangling.add(rank);
+            }
+        }
+        streamed.stats.active = members.size();
+        streamed.stats.dangling = dangling.value();
+        streamed.stats.residual = residual.value();
+        streamed.stats.rank_mass = rank_mass.value();
         break;
     }
-    result.stats.emitted = result.batch.messages.size();
+    default:
+        throw std::invalid_argument("unsupported graph algorithm");
+    }
+    return streamed;
+}
+
+StreamedPartition scatter_partition(const Graph& graph, const Shards& shards,
+                                    const Program& program, const StepInput& input,
+                                    std::span<const VertexState> settled_states,
+                                    std::size_t chunk_capacity, const EmitChunk& emit) {
+    if (chunk_capacity == 0) {
+        throw std::invalid_argument("message chunk capacity must be positive");
+    }
+    if (settled_states.size() != shards.vertices(input.partition).size()) {
+        throw std::invalid_argument("scatter received a mismatched settled state image");
+    }
+    const auto members = shards.vertices(input.partition);
+    StreamedPartition streamed;
+    streamed.stats.consumed = input.inbox.size();
+
+    // Walk the settled vertices once and push every legal edge through the
+    // fixed-capacity sink. The buffered chunk is the only outbound storage, so
+    // peak buffer use stays at chunk_capacity even for a million-edge source.
+    SourceSink sink(chunk_capacity, emit);
+    switch (program.algorithm) {
+    case Algorithm::bfs:
+        for (const auto& message : input.inbox) {
+            const auto member = std::lower_bound(members.begin(), members.end(), message.target);
+            const auto index = static_cast<std::size_t>(member - members.begin());
+            const auto distance = settled_states[index].distance;
+            // A state only changes once per step (first, smallest inbox value),
+            // which is exactly when the original kernel scattered.
+            if (distance != static_cast<std::uint32_t>(message.value)) {
+                continue;
+            }
+            const auto next = static_cast<double>(distance) + 1.0;
+            sink.source(message.target);
+            for (const auto target : graph.outgoing(message.target)) {
+                sink.add(target, next);
+            }
+        }
+        break;
+    case Algorithm::pagerank:
+        for (std::size_t index = 0; index < members.size(); ++index) {
+            const auto vertex = members[index];
+            const auto degree = graph.outgoing(vertex).size();
+            if (degree == 0) {
+                continue;
+            }
+            const auto share = settled_states[index].rank / static_cast<double>(degree);
+            sink.source(vertex);
+            for (const auto target : graph.outgoing(vertex)) {
+                sink.add(target, share);
+            }
+        }
+        break;
+    default:
+        throw std::invalid_argument("unsupported graph algorithm");
+    }
+
+    sink.finish();
+    streamed.chunks = sink.chunks();
+    streamed.stats.emitted = sink.emitted();
+    streamed.stats.active = members.size();
+    return streamed;
+}
+
+StreamedPartition run_partition_streamed(const Graph& graph, const Shards& shards,
+                                         const Program& program, const WorkerAttempt& attempt,
+                                         const StepInput& input, std::size_t chunk_capacity,
+                                         const EmitChunk& emit) {
+    auto streamed = settle_partition(graph, shards, program, attempt, input);
+    const auto scattered = scatter_partition(graph, shards, program, input, streamed.states,
+                                             chunk_capacity, emit);
+    streamed.chunks = scattered.chunks;
+    streamed.stats.emitted = scattered.stats.emitted;
+    return streamed;
+}
+
+PartitionResult run_partition(const Graph& graph, const Shards& shards, const Program& program,
+                              const WorkerAttempt& attempt, const StepInput& input) {
+    PartitionResult result;
+    result.batch = {input.epoch, attempt, input.partition, {}};
+    auto& messages = result.batch.messages;
+    const auto streamed = run_partition_streamed(
+        graph, shards, program, attempt, input, message_chunk_capacity,
+        [&](std::uint32_t, bool, MessageChunk chunk) {
+            messages.insert(messages.end(), chunk.begin(), chunk.end());
+        });
+    result.states = std::move(streamed.states);
+    result.stats = std::move(streamed.stats);
+    result.stats.emitted = messages.size();
     return result;
 }
 

@@ -22,6 +22,7 @@ enum class Kind : std::uint32_t {
     import_shard,
     exported,
     imported,
+    batch_chunk,
     close,
     closed,
     error
@@ -103,12 +104,43 @@ private:
 
 void encode(Encoder& out, const WorkerAttempt& attempt);
 void encode(Encoder& out, const StepInput& work);
-void encode(Encoder& out, const PartitionResult& result);
 void encode(Encoder& out, const BarrierReceipt& receipt);
+
+// One bounded outbound buffer crossing the channel. A partition's ordered
+// message stream is carried by a run of chunks whose sequences start at zero;
+// the closing chunk (last == true) also carries the resulting states and step
+// statistics, which lets the worker emit frames while the kernel is still
+// running instead of buffering the whole degree-sized partition stream.
+struct BatchChunk {
+    Epoch epoch{};
+    WorkerAttempt attempt;
+    Partition source_partition{};
+    std::uint32_t sequence{};
+    bool last{};
+    std::span<const Message> messages;
+    std::span<const VertexState> states;  // populated on the closing chunk only
+    StepStats stats{};                    // populated on the closing chunk only
+};
+
+void encode(Encoder& out, const BatchChunk& chunk);
+// Reads one frame worth of messages into its own storage; the caller appends
+// them to the partition's reassembly buffer in arrival order.
+struct DecodedChunk {
+    Epoch epoch{};
+    WorkerAttempt attempt;
+    Partition source_partition{};
+    std::uint32_t sequence{};
+    bool last{};
+    std::vector<Message> messages;
+    std::vector<VertexState> states;
+    StepStats stats{};
+    bool has_payload{};
+};
+
+DecodedChunk decode_chunk(Decoder& in, const Graph& graph, const Shards& shards);
 
 WorkerAttempt decode_attempt(Decoder& in);
 StepInput decode_work(Decoder& in, const Graph& graph, const Shards& shards);
-PartitionResult decode_result(Decoder& in, const Graph& graph, const Shards& shards);
 BarrierReceipt decode_receipt(Decoder& in);
 
 }  // namespace frontier::wire

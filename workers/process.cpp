@@ -2,6 +2,7 @@
 #include "graph/text.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -140,29 +141,69 @@ private:
         if (!pending_.empty() || input.u32() != assigned_.size()) {
             throw Failure("worker has pending acknowledgements or incomplete work");
         }
-        std::vector<PartitionResult> results;
-        results.reserve(assigned_.size());
         for (const auto part : assigned_) {
             auto work = wire::decode_work(input, graph_, shards_);
             if (work.partition != part) {
                 throw Failure("worker received out-of-order partition work");
             }
             require_resident(work);
-            results.push_back(run_partition(graph_, shards_, program_, attempt_, work));
+            stream_partition(channel, work);
         }
         input.finish();
+    }
 
-        Encoder reply;
-        encode_header(reply, attempt_, epoch_);
-        reply.u32(static_cast<std::uint32_t>(results.size()));
-        for (auto& result : results) {
-            const auto part = result.batch.source_partition;
-            wire::encode(reply, result);
-            pending_.push_back({epoch_, attempt_, part, batch_digest(result.batch), result.stats});
-            resident_[part] = std::move(result.states);
-            imported_[part].reset();
+    // Settle the partition, then scatter its ordered message stream through
+    // fixed-capacity chunk frames. The kernel keeps at most one chunk
+    // (message_chunk_capacity messages) resident at a time, so outbound buffer
+    // use stays bounded even when a single vertex has a million outgoing edges.
+    void stream_partition(const wire::Channel& channel, const StepInput& work) {
+        // Pass one: settle states and statistics without any scatter buffer.
+        const auto settled = settle_partition(graph_, shards_, program_, attempt_, work);
+
+        // Pass two: a single edge-walk that flushes each bounded chunk as a
+        // frame while the chunk's span is still valid, folding its messages
+        // straight into a streaming digest. Every frame - including the closing
+        // one - is encoded inside the callback before the sink reuses its
+        // buffer, so no span outlives the call and no degree-sized buffer forms.
+        // The closing frame carries the settled states and the emission count
+        // reached up to and including its own chunk.
+        BatchDigester digester(work.epoch, attempt_, work.partition);
+        auto stats = settled.stats;
+        std::uint32_t sequence{};
+        std::uint64_t emitted{};
+        const auto scattered = scatter_partition(
+            graph_, shards_, program_, work, settled.states, message_chunk_capacity,
+            [&](std::uint32_t, bool last, MessageChunk messages) {
+                emitted += messages.size();
+                wire::BatchChunk frame;
+                frame.epoch = work.epoch;
+                frame.attempt = attempt_;
+                frame.source_partition = work.partition;
+                frame.sequence = sequence;
+                frame.last = last;
+                frame.messages = messages;
+                if (last) {
+                    frame.states = settled.states;
+                    frame.stats = stats;
+                    frame.stats.emitted = emitted;
+                }
+                Encoder body;
+                encode_header(body, attempt_, epoch_);
+                wire::encode(body, frame);
+                send(channel, Kind::batch_chunk, std::move(body), idle_deadline());
+
+                digester.add(messages);
+                ++sequence;
+            });
+
+        if (sequence != scattered.chunks || emitted != scattered.stats.emitted) {
+            throw Failure("partition chunk stream closed with an unexpected length");
         }
-        send(channel, Kind::batches, std::move(reply), idle_deadline());
+        stats.emitted = emitted;
+        pending_.push_back(
+            {epoch_, attempt_, work.partition, digester.finish(emitted), stats});
+        resident_[work.partition] = std::move(settled.states);
+        imported_[work.partition].reset();
     }
 
     void confirm(const wire::Channel& channel, Decoder& input) {
@@ -343,22 +384,50 @@ void WorkerProcess::submit(const Checkpoint& image, double original_dangling) co
 
 std::vector<PartitionResult> WorkerProcess::receive(const Graph& graph, const Shards& shards,
                                                     Epoch epoch) const {
-    const auto frame = channel_.expect(Kind::batches, deadline());
-    auto input = reply_header(frame, epoch);
-    if (input.u32() != assigned_.size()) {
-        throw Failure("worker omitted partition results");
-    }
+    // Reassemble each partition from its ordered chunk frames. The child emits
+    // one complete partition stream at a time in assigned_ order, so consume
+    // each stream fully before moving to the next partition.
     std::vector<PartitionResult> results;
     results.reserve(assigned_.size());
+
     for (const auto part : assigned_) {
-        auto result = wire::decode_result(input, graph, shards);
-        if (result.batch.source_partition != part || result.batch.attempt != attempt_ ||
-            result.batch.epoch != epoch || result.stats.emitted != result.batch.messages.size()) {
-            throw Failure("worker result has an incorrect partition, lease, epoch, or emission count");
+        PartitionResult result;
+        result.batch.epoch = epoch;
+        result.batch.attempt = attempt_;
+        result.batch.source_partition = part;
+
+        std::uint32_t sequence{};
+        bool closed{};
+        while (!closed) {
+            const auto frame = channel_.expect(Kind::batch_chunk, deadline());
+            auto input = reply_header(frame, epoch);
+            auto chunk = wire::decode_chunk(input, graph, shards);
+            input.finish();
+
+            if (chunk.attempt != attempt_ || chunk.epoch != epoch ||
+                chunk.source_partition != part || chunk.sequence != sequence) {
+                throw Failure("worker chunk carries a stale lease, gap or wrong partition");
+            }
+            if (chunk.last) {
+                if (!chunk.has_payload) {
+                    throw Failure("closing message chunk must carry partition state");
+                }
+                result.states = std::move(chunk.states);
+                result.stats = chunk.stats;
+            } else if (chunk.has_payload) {
+                throw Failure("only the closing message chunk may carry partition state");
+            }
+            result.batch.messages.insert(result.batch.messages.end(),
+                                         chunk.messages.begin(), chunk.messages.end());
+            closed = chunk.last;
+            ++sequence;
+        }
+        if (result.states.size() != shards.vertices(part).size() ||
+            result.stats.emitted != result.batch.messages.size()) {
+            throw Failure("worker result has a missing state image or incorrect emission count");
         }
         results.push_back(std::move(result));
     }
-    input.finish();
     return results;
 }
 

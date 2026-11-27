@@ -64,6 +64,39 @@ Digest batch_digest(const MessageBatch& batch) {
     return hash.value();
 }
 
+Digest streaming_batch_digest(const MessageBatch& batch) {
+    BatchDigester digester(batch.epoch, batch.attempt, batch.source_partition);
+    digester.add(batch.messages);
+    return digester.finish(batch.messages.size());
+}
+
+BatchDigester::BatchDigester(Epoch epoch, const WorkerAttempt& attempt, Partition partition) {
+    hash_.bytes("FrontierLoom streaming batch");
+    hash_.number(epoch);
+    hash_.number(attempt.worker);
+    hash_.number(attempt.topology);
+    hash_.number(attempt.incarnation);
+    hash_.number(partition);
+}
+
+void BatchDigester::add(const Message& message) {
+    hash_.number(message.source);
+    hash_.number(message.target);
+    hash_.number(std::bit_cast<std::uint64_t>(message.value));
+}
+
+void BatchDigester::add(std::span<const Message> messages) {
+    for (const auto& message : messages) {
+        add(message);
+    }
+}
+
+Digest BatchDigester::finish(std::uint64_t total) const {
+    Hash hash = hash_;
+    hash.number(total);
+    return hash.value();
+}
+
 Digest mailbox_digest(const Mailbox& mailbox) {
     Hash hash;
     hash.bytes("FrontierLoom mailbox");
